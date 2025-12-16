@@ -26,6 +26,7 @@ interface ProductInfo {
 interface ShopSettings {
   variantIds: string[];
   sendEmailNotification: boolean;
+  printedOverhead: number;
 }
 
 async function getShopSettings(admin: any): Promise<ShopSettings> {
@@ -54,6 +55,7 @@ async function getShopSettings(admin: any): Promise<ShopSettings> {
   return {
     variantIds: [],
     sendEmailNotification: true,
+    printedOverhead: 0,
   };
 }
 
@@ -178,6 +180,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return {
     products,
     sendEmailNotification: settings.sendEmailNotification,
+    printedOverhead: settings.printedOverhead ?? 0,
     currencyCode,
   };
 };
@@ -239,15 +242,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return { success: true, action: "updateSettings" };
   }
 
+  if (intent === "updateOverhead") {
+    const printedOverhead = parseFloat(formData.get("printedOverhead") as string) || 0;
+
+    settings.printedOverhead = Math.max(0, printedOverhead);
+    await saveShopSettings(admin, settings);
+
+    return { success: true, action: "updateOverhead" };
+  }
+
   return { success: false };
 };
 
 export default function SettingsPage() {
-  const { products, sendEmailNotification, currencyCode } =
+  const { products, sendEmailNotification, printedOverhead, currencyCode } =
     useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const [emailEnabled, setEmailEnabled] = useState(sendEmailNotification);
+  const [overhead, setOverhead] = useState(printedOverhead.toString());
 
   const isLoading = fetcher.state !== "idle";
 
@@ -323,6 +336,16 @@ export default function SettingsPage() {
     );
   }, [emailEnabled, fetcher]);
 
+  const handleSaveOverhead = useCallback(() => {
+    fetcher.submit(
+      {
+        intent: "updateOverhead",
+        printedOverhead: overhead,
+      },
+      { method: "POST" },
+    );
+  }, [overhead, fetcher]);
+
   useEffect(() => {
     if (fetcher.state === "idle" && fetcher.data?.success) {
       if (fetcher.data.action === "addProducts") {
@@ -333,6 +356,8 @@ export default function SettingsPage() {
         shopify.toast.show("Variant removed");
       } else if (fetcher.data.action === "updateSettings") {
         shopify.toast.show("Settings saved");
+      } else if (fetcher.data.action === "updateOverhead") {
+        shopify.toast.show("Printed overhead saved");
       }
     }
   }, [fetcher.state, fetcher.data, shopify]);
@@ -341,6 +366,10 @@ export default function SettingsPage() {
   useEffect(() => {
     setEmailEnabled(sendEmailNotification);
   }, [sendEmailNotification]);
+
+  useEffect(() => {
+    setOverhead(printedOverhead.toString());
+  }, [printedOverhead]);
 
   return (
     <s-page heading="Settings">
@@ -464,6 +493,37 @@ export default function SettingsPage() {
           When enabled, customers will receive an email with their gift card
           code(s) after their order is paid. The store admin can always view and
           print codes from the Orders page regardless of this setting.
+        </s-banner>
+      </s-section>
+
+      <s-section heading="Printed Overhead">
+        <s-paragraph>
+          Set an amount to deduct from the line item price when creating gift
+          card codes. This accounts for printing and production costs.
+        </s-paragraph>
+
+        <s-box padding="base">
+          <s-stack direction="inline" gap="base" alignItems="end">
+            <s-text-field
+              label="Overhead amount"
+              value={overhead}
+              onChange={(e: any) => setOverhead(e.target.value)}
+              prefix={currencyCode}
+            />
+            <s-button
+              onClick={handleSaveOverhead}
+              disabled={isLoading}
+            >
+              Save
+            </s-button>
+          </s-stack>
+        </s-box>
+
+        <s-banner tone="info">
+          For example, if a customer purchases a {formatCurrency(252, currencyCode)} gift card product
+          and the overhead is set to {formatCurrency(parseFloat(overhead) || 0, currencyCode)}, the
+          generated gift card code will be worth{" "}
+          {formatCurrency(Math.max(0, 252 - (parseFloat(overhead) || 0)), currencyCode)}.
         </s-banner>
       </s-section>
     </s-page>

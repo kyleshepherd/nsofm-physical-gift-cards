@@ -38,6 +38,7 @@ interface CreatedGiftCard {
 interface ShopSettings {
   variantIds: string[];
   sendEmailNotification: boolean;
+  printedOverhead: number;
 }
 
 function formatGiftCardCode(code: string): string {
@@ -115,11 +116,16 @@ export async function processGiftCardOrder(
   const customerEmail = payload.customer?.email || payload.email || "No email";
 
   for (const lineItem of giftCardLineItems) {
+    // Calculate gift card value by subtracting the printed overhead
+    const lineItemPrice = parseFloat(lineItem.price);
+    const overhead = settings.printedOverhead || 0;
+    const giftCardValue = Math.max(0, lineItemPrice - overhead).toFixed(2);
+
     for (let i = 0; i < lineItem.quantity; i++) {
       try {
         const giftCard = await createGiftCard(
           admin,
-          lineItem.price,
+          giftCardValue,
           payload.name,
           lineItem.title,
           customerName,
@@ -135,7 +141,7 @@ export async function processGiftCardOrder(
             giftCardId: giftCard.id,
             code: giftCard.code,
             maskedCode: giftCard.maskedCode,
-            value: lineItem.price,
+            value: giftCardValue,
             productTitle: lineItem.title,
           });
         }
@@ -196,6 +202,7 @@ async function getShopSettings(admin: any): Promise<ShopSettings> {
   return {
     variantIds: [],
     sendEmailNotification: true,
+    printedOverhead: 0,
   };
 }
 
