@@ -2,11 +2,44 @@ import type { LoaderFunctionArgs, HeadersFunction } from "react-router";
 import { useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
-import db from "../db.server";
 import { formatCurrency } from "../utils/currency";
 
+interface ShopSettings {
+  variantIds: string[];
+  sendEmailNotification: boolean;
+}
+
+async function getShopSettings(admin: any): Promise<ShopSettings> {
+  const response = await admin.graphql(
+    `#graphql
+    query getShopMetafields {
+      shop {
+        metafield(namespace: "$app:gift_cards", key: "settings") {
+          value
+        }
+      }
+    }`
+  );
+
+  const data = await response.json();
+  const settingsValue = data.data?.shop?.metafield?.value;
+
+  if (settingsValue) {
+    try {
+      return JSON.parse(settingsValue);
+    } catch {
+      // Invalid JSON, return defaults
+    }
+  }
+
+  return {
+    variantIds: [],
+    sendEmailNotification: true,
+  };
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session, admin } = await authenticate.admin(request);
+  const { admin } = await authenticate.admin(request);
 
   // Get shop currency
   const shopResponse = await admin.graphql(
@@ -14,72 +47,76 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     query getShopCurrency {
       shop {
         currencyCode
-        currencyFormats {
-          moneyFormat
-        }
       }
     }`
   );
   const shopData = await shopResponse.json();
   const currencyCode = shopData.data?.shop?.currencyCode || "USD";
 
-  // Get stats for the dashboard
-  const [productCount, giftCardCount, recentOrders] = await Promise.all([
-    db.giftCardProduct.count({
-      where: { shop: session.shop },
-    }),
-    db.giftCardRecord.count({
-      where: { shop: session.shop },
-    }),
-db.giftCardRecord.findMany({
-      where: { shop: session.shop },
-      orderBy: { createdAt: "desc" },
-      take: 50,
-      select: {
-        orderId: true,
-        orderName: true,
-        createdAt: true,
-        value: true,
-      },
-    }),
-  ]);
+  // Get settings from shop metafield
+  const settings = await getShopSettings(admin);
+  const productCount = settings.variantIds.length;
 
-  // Calculate total value
-  const totalValueResult = await db.giftCardRecord.aggregate({
-    where: { shop: session.shop },
-    _sum: { value: true },
-  });
+  // Query recent orders with gift cards
+  const ordersResponse = await admin.graphql(
+    `#graphql
+    query getRecentOrdersWithGiftCards {
+      orders(first: 50, sortKey: CREATED_AT, reverse: true) {
+        nodes {
+          id
+          name
+          createdAt
+          metafield(namespace: "$app:gift_cards", key: "created_codes") {
+            value
+          }
+        }
+      }
+    }`
+  );
 
-  // Group records by order and calculate totals
-  const orderMap = new Map<string, { orderName: string; totalValue: number; createdAt: Date }>();
-  for (const record of recentOrders) {
-    const existing = orderMap.get(record.orderId);
-    if (existing) {
-      existing.totalValue += Number(record.value);
-    } else {
-      orderMap.set(record.orderId, {
-        orderName: record.orderName,
-        totalValue: Number(record.value),
-        createdAt: record.createdAt,
-      });
+  const ordersData = await ordersResponse.json();
+  const allOrders = ordersData.data?.orders?.nodes || [];
+
+  // Filter to only orders with gift cards and calculate stats
+  let giftCardCount = 0;
+  let totalValue = 0;
+  const recentOrders: { orderId: string; orderName: string; totalValue: number; createdAt: string; productTitles: string[] }[] = [];
+
+  for (const order of allOrders) {
+    if (order.metafield?.value) {
+      try {
+        const giftCardsData = JSON.parse(order.metafield.value);
+        const orderTotalValue = giftCardsData.reduce(
+          (sum: number, gc: any) => sum + parseFloat(gc.value),
+          0
+        );
+
+        // Get unique product titles
+        const productTitles = [...new Set(giftCardsData.map((gc: any) => gc.productTitle || "Gift Card"))] as string[];
+
+        giftCardCount += giftCardsData.length;
+        totalValue += orderTotalValue;
+
+        if (recentOrders.length < 5) {
+          recentOrders.push({
+            orderId: order.id,
+            orderName: order.name,
+            totalValue: orderTotalValue,
+            createdAt: order.createdAt,
+            productTitles,
+          });
+        }
+      } catch {
+        // Invalid JSON, skip
+      }
     }
   }
-
-  // Convert to array and take top 5
-  const groupedOrders = Array.from(orderMap.entries())
-    .map(([orderId, data]) => ({
-      orderId,
-      ...data,
-    }))
-    .slice(0, 5);
 
   return {
     productCount,
     giftCardCount,
-    totalValue: totalValueResult._sum.value
-      ? Number(totalValueResult._sum.value)
-      : 0,
-    recentOrders: groupedOrders,
+    totalValue,
+    recentOrders,
     currencyCode,
   };
 };
@@ -88,7 +125,7 @@ export default function Index() {
   const { productCount, giftCardCount, totalValue, recentOrders, currencyCode } =
     useLoaderData<typeof loader>();
 
-  const formatDate = (date: Date | string) => {
+  const formatDate = (date: string) => {
     return new Date(date).toLocaleDateString("en-US", {
       month: "short",
       day: "numeric",
@@ -114,7 +151,7 @@ export default function Index() {
           <s-box padding="base" borderWidth="base" borderRadius="base">
             <s-stack direction="block" gap="small">
               <s-heading>{productCount}</s-heading>
-              <s-text>Gift Card Products</s-text>
+              <s-text>Gift Card Variants</s-text>
             </s-stack>
           </s-box>
 
@@ -160,12 +197,15 @@ export default function Index() {
                   borderWidth="base"
                   borderRadius="base"
                 >
-                  <s-stack direction="inline" gap="base" alignItems="center">
-                    <s-text type="strong">{order.orderName}</s-text>
-                    <s-text>{formatCurrency(order.totalValue, currencyCode)}</s-text>
-                    <s-text color="subdued">
-                      {formatDate(order.createdAt)}
-                    </s-text>
+                  <s-stack direction="block" gap="small-200">
+                    <s-stack direction="inline" gap="base" alignItems="center">
+                      <s-text type="strong">{order.orderName}</s-text>
+                      <s-text>{formatCurrency(order.totalValue, currencyCode)}</s-text>
+                      <s-text color="subdued">
+                        {formatDate(order.createdAt)}
+                      </s-text>
+                    </s-stack>
+                    <s-text color="subdued">{order.productTitles.join(", ")}</s-text>
                   </s-stack>
                 </s-box>
               </s-link>
@@ -181,7 +221,7 @@ export default function Index() {
         <s-section heading="Waiting for Orders">
           <s-banner tone="info">
             <s-paragraph>
-              You have {productCount} product{productCount !== 1 ? "s" : ""}{" "}
+              You have {productCount} variant{productCount !== 1 ? "s" : ""}{" "}
               configured. When customers purchase these products, gift cards
               will be automatically created and appear here.
             </s-paragraph>
@@ -207,8 +247,8 @@ export default function Index() {
           <s-list-item>
             <s-text type="strong">3. View codes</s-text>
             <s-paragraph>
-              View gift card codes in the Orders page. Print and package them as
-              physical gift cards.
+              View gift card codes in the Orders page or directly in the order
+              notes. Print and package them as physical gift cards.
             </s-paragraph>
           </s-list-item>
         </s-unordered-list>

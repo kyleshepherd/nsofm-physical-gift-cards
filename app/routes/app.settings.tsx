@@ -8,7 +8,6 @@ import { useLoaderData, useFetcher } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
-import db from "../db.server";
 import { formatCurrency } from "../utils/currency";
 
 interface VariantInfo {
@@ -24,8 +23,83 @@ interface ProductInfo {
   variants: VariantInfo[];
 }
 
+interface ShopSettings {
+  variantIds: string[];
+  sendEmailNotification: boolean;
+}
+
+async function getShopSettings(admin: any): Promise<ShopSettings> {
+  const response = await admin.graphql(
+    `#graphql
+    query getShopMetafields {
+      shop {
+        metafield(namespace: "$app:gift_cards", key: "settings") {
+          value
+        }
+      }
+    }`
+  );
+
+  const data = await response.json();
+  const settingsValue = data.data?.shop?.metafield?.value;
+
+  if (settingsValue) {
+    try {
+      return JSON.parse(settingsValue);
+    } catch {
+      // Invalid JSON, return defaults
+    }
+  }
+
+  return {
+    variantIds: [],
+    sendEmailNotification: true,
+  };
+}
+
+async function saveShopSettings(admin: any, settings: ShopSettings): Promise<void> {
+  const response = await admin.graphql(
+    `#graphql
+    query getShopId {
+      shop {
+        id
+      }
+    }`
+  );
+  const shopData = await response.json();
+  const shopId = shopData.data?.shop?.id;
+
+  await admin.graphql(
+    `#graphql
+    mutation saveSettings($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields {
+          id
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }`,
+    {
+      variables: {
+        metafields: [
+          {
+            ownerId: shopId,
+            namespace: "$app:gift_cards",
+            key: "settings",
+            type: "json",
+            value: JSON.stringify(settings),
+          },
+        ],
+      },
+    }
+  );
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session, admin } = await authenticate.admin(request);
+  const { admin } = await authenticate.admin(request);
 
   // Get shop currency
   const shopResponse = await admin.graphql(
@@ -39,74 +113,65 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const shopData = await shopResponse.json();
   const currencyCode = shopData.data?.shop?.currencyCode || "USD";
 
-  // Get configured gift card products with variants from DB
-  const giftCardProducts = await db.giftCardProduct.findMany({
-    where: { shop: session.shop },
-    select: { productId: true, variantId: true },
-  });
+  // Get settings from shop metafield
+  const settings = await getShopSettings(admin);
 
-  // Get app settings
-  let settings = await db.appSettings.findUnique({
-    where: { shop: session.shop },
-  });
-
-  if (!settings) {
-    settings = await db.appSettings.create({
-      data: {
-        shop: session.shop,
-        sendEmailNotification: true,
-      },
-    });
-  }
-
-  // Group variants by product ID
-  const productVariantMap = new Map<string, string[]>();
-  for (const gcp of giftCardProducts) {
-    const existing = productVariantMap.get(gcp.productId) || [];
-    existing.push(gcp.variantId);
-    productVariantMap.set(gcp.productId, existing);
-  }
+  // Group variant IDs by product (we need to fetch product info)
+  const variantIds = settings.variantIds;
 
   // Fetch product and variant details for display
   const products: ProductInfo[] = [];
-  for (const [productId, variantIds] of productVariantMap) {
-    try {
-      const response = await admin.graphql(
-        `#graphql
-        query getProduct($id: ID!) {
-          product(id: $id) {
+  const productMap = new Map<string, VariantInfo[]>();
+
+  if (variantIds.length > 0) {
+    // Fetch all variants in one query
+    const response = await admin.graphql(
+      `#graphql
+      query getVariants($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on ProductVariant {
             id
             title
-            handle
-            variants(first: 100) {
-              nodes {
-                id
-                title
-                price
-              }
+            price
+            product {
+              id
+              title
+              handle
             }
           }
-        }`,
-        {
-          variables: { id: productId },
-        },
-      );
-      const data = await response.json();
-      if (data.data?.product) {
-        const product = data.data.product;
-        // Filter to only show variants we have stored
-        const selectedVariants = product.variants.nodes.filter(
-          (v: VariantInfo) => variantIds.includes(v.id),
-        );
-        products.push({
-          id: product.id,
-          title: product.title,
-          handle: product.handle,
-          variants: selectedVariants,
+        }
+      }`,
+      { variables: { ids: variantIds } }
+    );
+
+    const data = await response.json();
+
+    for (const node of data.data?.nodes || []) {
+      if (node?.product) {
+        const productId = node.product.id;
+        const existing = productMap.get(productId) || [];
+        existing.push({
+          id: node.id,
+          title: node.title,
+          price: node.price,
         });
+        productMap.set(productId, existing);
+
+        // Store product info if not already
+        if (!products.find((p) => p.id === productId)) {
+          products.push({
+            id: productId,
+            title: node.product.title,
+            handle: node.product.handle,
+            variants: [],
+          });
+        }
       }
-    } catch (error) {
-      console.error(`Failed to fetch product ${productId}:`, error);
+    }
+
+    // Attach variants to products
+    for (const product of products) {
+      product.variants = productMap.get(product.id) || [];
     }
   }
 
@@ -118,32 +183,27 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
+
+  // Get current settings
+  const settings = await getShopSettings(admin);
 
   if (intent === "addProducts") {
     // Data structure: [{ productId, variants: [{ id }] }]
     const productsData = JSON.parse(formData.get("productsData") as string);
 
+    // Add new variant IDs to settings
+    const newVariantIds = new Set(settings.variantIds);
     for (const product of productsData) {
       for (const variant of product.variants) {
-        await db.giftCardProduct.upsert({
-          where: {
-            shop_variantId: {
-              shop: session.shop,
-              variantId: variant.id,
-            },
-          },
-          create: {
-            shop: session.shop,
-            productId: product.id,
-            variantId: variant.id,
-          },
-          update: {},
-        });
+        newVariantIds.add(variant.id);
       }
     }
+
+    settings.variantIds = Array.from(newVariantIds);
+    await saveShopSettings(admin, settings);
 
     return { success: true, action: "addProducts" };
   }
@@ -151,25 +211,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (intent === "removeVariant") {
     const variantId = formData.get("variantId") as string;
 
-    await db.giftCardProduct.deleteMany({
-      where: {
-        shop: session.shop,
-        variantId,
-      },
-    });
+    settings.variantIds = settings.variantIds.filter((id) => id !== variantId);
+    await saveShopSettings(admin, settings);
 
     return { success: true, action: "removeVariant" };
   }
 
   if (intent === "removeProduct") {
     const productId = formData.get("productId") as string;
+    const variantIdsToRemove = JSON.parse(formData.get("variantIds") as string) as string[];
 
-    await db.giftCardProduct.deleteMany({
-      where: {
-        shop: session.shop,
-        productId,
-      },
-    });
+    settings.variantIds = settings.variantIds.filter(
+      (id) => !variantIdsToRemove.includes(id)
+    );
+    await saveShopSettings(admin, settings);
 
     return { success: true, action: "removeProduct" };
   }
@@ -178,16 +233,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const sendEmailNotification =
       formData.get("sendEmailNotification") === "true";
 
-    await db.appSettings.upsert({
-      where: { shop: session.shop },
-      create: {
-        shop: session.shop,
-        sendEmailNotification,
-      },
-      update: {
-        sendEmailNotification,
-      },
-    });
+    settings.sendEmailNotification = sendEmailNotification;
+    await saveShopSettings(admin, settings);
 
     return { success: true, action: "updateSettings" };
   }
@@ -238,11 +285,12 @@ export default function SettingsPage() {
   }, [shopify, products, fetcher]);
 
   const handleRemoveProduct = useCallback(
-    (productId: string) => {
+    (productId: string, variantIds: string[]) => {
       fetcher.submit(
         {
           intent: "removeProduct",
           productId,
+          variantIds: JSON.stringify(variantIds),
         },
         { method: "POST" },
       );
@@ -338,7 +386,12 @@ export default function SettingsPage() {
                     <s-button
                       variant="tertiary"
                       tone="critical"
-                      onClick={() => handleRemoveProduct(product.id)}
+                      onClick={() =>
+                        handleRemoveProduct(
+                          product.id,
+                          product.variants.map((v) => v.id)
+                        )
+                      }
                       disabled={isLoading}
                     >
                       Remove All

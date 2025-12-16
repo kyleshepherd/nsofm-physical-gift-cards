@@ -1,4 +1,3 @@
-import db from "../db.server";
 import { unauthenticated } from "../shopify.server";
 
 interface WebhookLineItem {
@@ -16,6 +15,7 @@ export interface OrderWebhookPayload {
   admin_graphql_api_id: string;
   name: string;
   email?: string;
+  note?: string;
   customer?: {
     id: number;
     admin_graphql_api_id: string;
@@ -32,41 +32,67 @@ interface CreatedGiftCard {
   code: string;
   maskedCode: string;
   value: string;
+  productTitle: string;
+}
+
+interface ShopSettings {
+  variantIds: string[];
+  sendEmailNotification: boolean;
+}
+
+function formatGiftCardCode(code: string): string {
+  return (code.match(/.{1,4}/g)?.join(" ") || code).toUpperCase();
 }
 
 export async function processGiftCardOrder(
   shop: string,
   payload: OrderWebhookPayload
 ) {
-  // 1. Check if we've already processed this order (idempotency)
-  const existingRecords = await db.giftCardRecord.findFirst({
-    where: {
-      shop,
-      orderId: payload.admin_graphql_api_id,
-    },
-  });
+  // Get admin client for GraphQL operations
+  const { admin } = await unauthenticated.admin(shop);
 
-  if (existingRecords) {
+  // Get shop currency
+  const shopResponse = await admin.graphql(
+    `#graphql
+    query getShopCurrency {
+      shop {
+        currencyCode
+      }
+    }`
+  );
+  const shopData = await shopResponse.json();
+  const currencyCode = shopData.data?.shop?.currencyCode || "USD";
+
+  // 1. Check if we've already processed this order (check for metafield)
+  const orderCheckResponse = await admin.graphql(
+    `#graphql
+    query checkOrderMetafield($id: ID!) {
+      order(id: $id) {
+        metafield(namespace: "$app:gift_cards", key: "created_codes") {
+          value
+        }
+      }
+    }`,
+    { variables: { id: payload.admin_graphql_api_id } }
+  );
+  const orderCheckData = await orderCheckResponse.json();
+
+  if (orderCheckData.data?.order?.metafield?.value) {
     console.log(
       `Order ${payload.name} already processed, skipping duplicate webhook`
     );
     return;
   }
 
-  // 2. Get all gift card variant IDs for this shop
-  const giftCardProducts = await db.giftCardProduct.findMany({
-    where: { shop },
-    select: { variantId: true },
-  });
+  // 2. Get shop settings from metafield
+  const settings = await getShopSettings(admin);
 
-  if (giftCardProducts.length === 0) {
+  if (settings.variantIds.length === 0) {
     console.log(`No gift card variants configured for ${shop}`);
     return;
   }
 
-  const giftCardVariantIds = new Set(
-    giftCardProducts.map((p) => p.variantId)
-  );
+  const giftCardVariantIds = new Set(settings.variantIds);
 
   // 3. Filter line items that are gift card variants
   const giftCardLineItems = payload.line_items.filter((item) => {
@@ -79,16 +105,7 @@ export async function processGiftCardOrder(
     return;
   }
 
-  // 4. Get app settings for email notification preference
-  const settings = await db.appSettings.findUnique({
-    where: { shop },
-  });
-  const sendEmail = settings?.sendEmailNotification ?? true;
-
-  // 5. Get admin client for GraphQL operations
-  const { admin } = await unauthenticated.admin(shop);
-
-  // 6. Create gift cards for each line item (one per quantity)
+  // 4. Create gift cards for each line item (one per quantity)
   const createdGiftCards: CreatedGiftCard[] = [];
 
   // Build customer info for notes
@@ -100,13 +117,16 @@ export async function processGiftCardOrder(
   for (const lineItem of giftCardLineItems) {
     for (let i = 0; i < lineItem.quantity; i++) {
       try {
-        const note = `Order: ${payload.name}\nProduct: ${lineItem.title}\nCustomer: ${customerName}\nEmail: ${customerEmail}`;
         const giftCard = await createGiftCard(
           admin,
           lineItem.price,
-          note,
+          payload.name,
+          lineItem.title,
+          customerName,
+          customerEmail,
           payload.customer?.admin_graphql_api_id,
-          sendEmail
+          settings.sendEmailNotification,
+          currencyCode
         );
 
         if (giftCard) {
@@ -116,22 +136,7 @@ export async function processGiftCardOrder(
             code: giftCard.code,
             maskedCode: giftCard.maskedCode,
             value: lineItem.price,
-          });
-
-          // Store record in database
-          await db.giftCardRecord.create({
-            data: {
-              shop,
-              orderId: payload.admin_graphql_api_id,
-              orderName: payload.name,
-              lineItemId: lineItem.admin_graphql_api_id,
-              giftCardId: giftCard.id,
-              giftCardCode: giftCard.code,
-              value: parseFloat(lineItem.price),
-              customerId: payload.customer?.admin_graphql_api_id,
-              customerName: customerName !== "Guest" ? customerName : null,
-              customerEmail: customerEmail !== "No email" ? customerEmail : null,
-            },
+            productTitle: lineItem.title,
           });
         }
       } catch (error) {
@@ -144,16 +149,18 @@ export async function processGiftCardOrder(
     }
   }
 
-  // 7. Store gift card codes as metafield on order
+  // 5. Store gift card codes as metafield on order and add to order notes
   if (createdGiftCards.length > 0) {
     try {
-      await setOrderGiftCardMetafield(
+      await updateOrderWithGiftCards(
         admin,
         payload.admin_graphql_api_id,
-        createdGiftCards
+        createdGiftCards,
+        payload.note,
+        currencyCode
       );
     } catch (error) {
-      console.error(`Failed to set metafield on order ${payload.name}:`, error);
+      console.error(`Failed to update order ${payload.name}:`, error);
       // Gift cards were still created successfully
     }
   }
@@ -163,13 +170,49 @@ export async function processGiftCardOrder(
   );
 }
 
+async function getShopSettings(admin: any): Promise<ShopSettings> {
+  const response = await admin.graphql(
+    `#graphql
+    query getShopMetafields {
+      shop {
+        metafield(namespace: "$app:gift_cards", key: "settings") {
+          value
+        }
+      }
+    }`
+  );
+
+  const data = await response.json();
+  const settingsValue = data.data?.shop?.metafield?.value;
+
+  if (settingsValue) {
+    try {
+      return JSON.parse(settingsValue);
+    } catch {
+      // Invalid JSON, return defaults
+    }
+  }
+
+  return {
+    variantIds: [],
+    sendEmailNotification: true,
+  };
+}
+
 async function createGiftCard(
   admin: any,
   value: string,
-  note: string,
+  orderName: string,
+  productTitle: string,
+  customerName: string,
+  customerEmail: string,
   customerId: string | undefined,
-  sendEmail: boolean
+  sendEmail: boolean,
+  currencyCode: string
 ): Promise<{ id: string; code: string; maskedCode: string } | null> {
+  // Note will include the full code after creation
+  const initialNote = `Order: ${orderName}\nProduct: ${productTitle}\nCustomer: ${customerName}\nEmail: ${customerEmail}\nValue: ${value} ${currencyCode}`;
+
   const response = await admin.graphql(
     `#graphql
     mutation giftCardCreate($input: GiftCardCreateInput!) {
@@ -193,9 +236,8 @@ async function createGiftCard(
       variables: {
         input: {
           initialValue: value,
-          note,
+          note: initialNote,
           // Only associate with customer if we want to send email notification
-          // (associating a customer automatically triggers the notification email)
           ...(sendEmail && customerId && { customerId }),
         },
       },
@@ -220,6 +262,30 @@ async function createGiftCard(
     return null;
   }
 
+  // Update the gift card note to include the full code (formatted)
+  const formattedCode = formatGiftCardCode(code);
+  const fullNote = `Order: ${orderName}\nProduct: ${productTitle}\nCustomer: ${customerName}\nEmail: ${customerEmail}\nValue: ${value} ${currencyCode}\n\nFull Code: ${formattedCode}`;
+
+  await admin.graphql(
+    `#graphql
+    mutation giftCardUpdate($id: ID!, $input: GiftCardUpdateInput!) {
+      giftCardUpdate(id: $id, input: $input) {
+        userErrors {
+          field
+          message
+        }
+      }
+    }`,
+    {
+      variables: {
+        id: giftCard.id,
+        input: {
+          note: fullNote,
+        },
+      },
+    }
+  );
+
   if (sendEmail && customerId) {
     console.log(`Gift card ${giftCard.id} created with customer association - notification sent automatically`);
   }
@@ -231,29 +297,48 @@ async function createGiftCard(
   };
 }
 
-async function setOrderGiftCardMetafield(
+async function updateOrderWithGiftCards(
   admin: any,
   orderId: string,
-  giftCards: CreatedGiftCard[]
+  giftCards: CreatedGiftCard[],
+  existingNote: string | undefined,
+  currencyCode: string
 ) {
-  // Store codes for admin viewing/printing
+  // Build the gift card note section
+  const giftCardNoteLines = giftCards.map((gc, index) => {
+    const formattedCode = formatGiftCardCode(gc.code);
+    return `Gift Card #${index + 1}: ${formattedCode}\nProduct: ${gc.productTitle}\nValue: ${gc.value} ${currencyCode}`;
+  });
+
+  const giftCardNote = `\n\n--- Physical Gift Cards ---\n${giftCardNoteLines.join("\n\n")}`;
+  const newNote = (existingNote || "") + giftCardNote;
+
+  // Store codes as metafield for app viewing
   const metafieldValue = JSON.stringify(
     giftCards.map((gc) => ({
       code: gc.code,
       value: gc.value,
       maskedCode: gc.maskedCode,
       giftCardId: gc.giftCardId,
+      productTitle: gc.productTitle,
     }))
   );
 
   const response = await admin.graphql(
     `#graphql
-    mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+    mutation updateOrderWithGiftCards($orderId: ID!, $note: String!, $metafields: [MetafieldsSetInput!]!) {
+      orderUpdate(input: { id: $orderId, note: $note }) {
+        order {
+          id
+        }
+        userErrors {
+          field
+          message
+        }
+      }
       metafieldsSet(metafields: $metafields) {
         metafields {
           id
-          namespace
-          key
         }
         userErrors {
           field
@@ -263,6 +348,8 @@ async function setOrderGiftCardMetafield(
     }`,
     {
       variables: {
+        orderId,
+        note: newNote,
         metafields: [
           {
             ownerId: orderId,
@@ -278,8 +365,11 @@ async function setOrderGiftCardMetafield(
 
   const data = await response.json();
 
+  if (data.data?.orderUpdate?.userErrors?.length > 0) {
+    console.error("Order update errors:", data.data.orderUpdate.userErrors);
+  }
+
   if (data.data?.metafieldsSet?.userErrors?.length > 0) {
     console.error("Metafield set errors:", data.data.metafieldsSet.userErrors);
-    throw new Error("Failed to set metafield");
   }
 }
