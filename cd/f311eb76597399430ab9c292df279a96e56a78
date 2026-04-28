@@ -1,0 +1,23 @@
+docs/superpowers/specs/2026-04-28-fly-io-migration-design.md
+  465535d53e596dae 1-120
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "cdf311eb76597399430ab9c292df279a96e56a78",
+  "prompts": {
+    "465535d53e596dae": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d3ed121c-3863-4ed2-add6-c24a15c8a2b4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Kyle Shepherd",
+      "messages": [],
+      "total_additions": 126,
+      "total_deletions": 6,
+      "accepted_lines": 120,
+      "overriden_lines": 0
+    }
+  }
+}
